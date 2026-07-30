@@ -12,8 +12,25 @@ final class AudioCapture {
 
     static let targetSampleRate: Double = 16_000
 
-    private let engine = AVAudioEngine()
+    /// Recreated on every start(): an AVAudioEngine binds to the input hardware
+    /// that existed when it was built. Reusing one across a device change (plug
+    /// in AirPods, switch mics) makes installTap throw the ObjC exception
+    /// "Input HW format and tap format not matching" — uncatchable from Swift,
+    /// so it takes the whole daemon down. The sibling project (quill) already
+    /// rebuilds its engine per recording; parrot didn't, and crashed in the
+    /// field on 2026-07-30.
+    private var engine = AVAudioEngine()
+    /// Built lazily from the format the tap actually delivers, and rebuilt if
+    /// that format ever changes mid-recording — so no assumption about the
+    /// input format can go stale.
     private var converter: AVAudioConverter?
+    private var converterInputFormat: AVAudioFormat?
+    private let targetFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: AudioCapture.targetSampleRate,
+        channels: 1,
+        interleaved: false
+    )!
     private var samples: [Float] = []
     private var isRecording = false
     private let lock = NSLock()
@@ -26,28 +43,22 @@ final class AudioCapture {
     func start() throws {
         guard !isRecording else { return }
 
+        // Fresh engine: binds to whatever input device is current right now.
+        engine = AVAudioEngine()
         let input = engine.inputNode
-        let inputFormat = input.outputFormat(forBus: 0)
 
-        let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: AudioCapture.targetSampleRate,
-            channels: 1,
-            interleaved: false
-        )!
-
-        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            throw CaptureError.converterCreationFailed
-        }
-        self.converter = converter
+        converter = nil
+        converterInputFormat = nil
 
         lock.lock()
         samples.removeAll(keepingCapacity: true)
         lock.unlock()
 
-        // Tap with input format; convert inside the callback.
-        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            self?.process(buffer: buffer, converter: converter, targetFormat: targetFormat)
+        // format: nil means "whatever this node natively delivers" — the one
+        // spelling that cannot mismatch the hardware. The conversion to 16 kHz
+        // mono happens in the callback, against the buffer's own format.
+        input.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+            self?.process(buffer: buffer)
         }
 
         engine.prepare()
@@ -76,11 +87,15 @@ final class AudioCapture {
         return captured
     }
 
-    private func process(
-        buffer: AVAudioPCMBuffer,
-        converter: AVAudioConverter,
-        targetFormat: AVAudioFormat
-    ) {
+    private func process(buffer: AVAudioPCMBuffer) {
+        // Build (or rebuild) the converter for the format actually arriving.
+        // A device swap mid-hold changes it; anything cached would be wrong.
+        if converterInputFormat != buffer.format || converter == nil {
+            converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+            converterInputFormat = buffer.format
+        }
+        guard let converter else { return }
+
         // Output buffer capacity scales with sample-rate ratio.
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
