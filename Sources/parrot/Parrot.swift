@@ -8,7 +8,7 @@ struct Parrot: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "parrot",
         abstract: "Minimal macOS dictation daemon. Hold Fn, speak, release.",
-        subcommands: [Run.self, Setup.self, Doctor.self, Models.self, Install.self],
+        subcommands: [Run.self, Setup.self, Doctor.self, Models.self, Install.self, Transcribe.self],
         defaultSubcommand: Run.self
     )
 }
@@ -34,6 +34,12 @@ struct Run: ParsableCommand {
     @Option(name: .long, help: "Model id to use. Defaults to the recommended model.")
     var model: String?
 
+    @Option(
+        name: .long,
+        help: "Dictation language code (pt, en, es…). Defaults to auto-detect on multilingual models."
+    )
+    var language: String?
+
     func run() throws {
         if !skipDoctor {
             let checks = DoctorReport.run()
@@ -45,23 +51,10 @@ struct Run: ParsableCommand {
             }
         }
 
-        let chosenModel: TranscriptionModel
-        if let id = model {
-            guard let m = ModelRegistry.find(id) else {
-                FileHandle.standardError.write(Data("unknown model: \(id)\n".utf8))
-                FileHandle.standardError.write(Data("run `parrot models list` to see options.\n".utf8))
-                throw ExitCode(1)
-            }
-            chosenModel = m
-        } else {
-            guard let m = ModelRegistry.recommended() else {
-                FileHandle.standardError.write(Data("no models registered\n".utf8))
-                throw ExitCode(1)
-            }
-            chosenModel = m
-        }
+        let chosenModel = try Resolve.model(flag: model)
+        let chosenLanguage = try Resolve.language(flag: language, for: chosenModel)
 
-        let transcriber = WhisperKitTranscriber(model: chosenModel)
+        let transcriber = WhisperKitTranscriber(model: chosenModel, language: chosenLanguage)
         let warmupSemaphore = DispatchSemaphore(value: 0)
         var warmupError: Error?
         Task.detached {
@@ -169,8 +162,119 @@ struct Run: ParsableCommand {
         sigint.resume()
         signal(SIGINT, SIG_IGN)
 
-        FileHandle.standardError.write(Data("listening on fn hold · model: \(chosenModel.id) · ^C to quit\n".utf8))
+        let lang = chosenLanguage ?? "auto"
+        FileHandle.standardError.write(Data(
+            "listening on fn hold · model: \(chosenModel.id) · lang: \(lang) · ^C to quit\n".utf8
+        ))
         app.run()
+    }
+}
+
+/// Model + language resolution shared by `run` and `transcribe`: CLI flag >
+/// config file > default.
+enum Resolve {
+    static func model(flag: String?) throws -> TranscriptionModel {
+        if let id = flag ?? Config.model() {
+            guard let m = ModelRegistry.find(id) else {
+                FileHandle.standardError.write(Data("unknown model: \(id)\n".utf8))
+                FileHandle.standardError.write(Data("run `parrot models list` to see options.\n".utf8))
+                throw ExitCode(1)
+            }
+            return m
+        }
+        guard let m = ModelRegistry.recommended() else {
+            FileHandle.standardError.write(Data("no models registered\n".utf8))
+            throw ExitCode(1)
+        }
+        return m
+    }
+
+    /// Validates against WhisperKit's own supported set, and refuses a
+    /// non-English language on an English-only model — the .en checkpoints have
+    /// no language tokens at all, so asking for pt there silently yields
+    /// English, which is the exact failure this flag exists to prevent.
+    static func language(flag: String?, for model: TranscriptionModel) throws -> String? {
+        guard let code = (flag ?? Config.language())?.lowercased(), !code.isEmpty else { return nil }
+        // "auto" is how you ask for detection from the command line when the
+        // config file already names a language — otherwise the config wins and
+        // there's no way back to detection without editing the file.
+        if code == "auto" { return nil }
+        guard Constants.languageCodes.contains(code) else {
+            FileHandle.standardError.write(Data("unsupported language code: \(code)\n".utf8))
+            throw ExitCode(1)
+        }
+        if !model.languages.contains("multi"), code != "en" {
+            FileHandle.standardError.write(Data(
+                "model \(model.id) is English-only — \(code) needs a multilingual model.\n".utf8
+            ))
+            FileHandle.standardError.write(Data(
+                "try: parrot run --model whisper-large-v3-turbo --language \(code)\n".utf8
+            ))
+            throw ExitCode(1)
+        }
+        return code
+    }
+}
+
+/// Transcribe an audio file instead of the microphone. Not part of the
+/// dictation loop — it exists so the model/language path can be exercised and
+/// diffed without holding down fn (and to check a bad transcript against the
+/// same audio afterwards).
+struct Transcribe: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Transcribe an audio file and print the text (debug/verification)."
+    )
+
+    @Argument(help: "Audio file to transcribe (wav, caf, m4a…).")
+    var file: String
+
+    @Option(name: .long, help: "Model id to use.")
+    var model: String?
+
+    @Option(name: .long, help: "Language code (pt, en, es…). Default: auto-detect.")
+    var language: String?
+
+    @Flag(name: .long, help: "Print WhisperKit's own decoding log (prefill tokens, detected language).")
+    var verbose: Bool = false
+
+    func run() throws {
+        let chosenModel = try Resolve.model(flag: model)
+        let chosenLanguage = try Resolve.language(flag: language, for: chosenModel)
+        let path = (file as NSString).expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: path) else {
+            FileHandle.standardError.write(Data("no such file: \(path)\n".utf8))
+            throw ExitCode(1)
+        }
+
+        let transcriber = WhisperKitTranscriber(
+            model: chosenModel,
+            language: chosenLanguage,
+            verbose: verbose
+        )
+        let sem = DispatchSemaphore(value: 0)
+        var failure: Error?
+        Task.detached {
+            do {
+                let samples = try AudioProcessor.loadAudioAsFloatArray(fromPath: path)
+                let started = Date()
+                let text = try await transcriber.transcribe(samples)
+                let elapsed = Date().timeIntervalSince(started)
+                let seconds = Double(samples.count) / AudioCapture.targetSampleRate
+                FileHandle.standardError.write(Data(String(
+                    format: "%.1fs audio · %.1fs transcribe · model %@ · lang %@\n",
+                    seconds, elapsed, chosenModel.id, chosenLanguage ?? "auto"
+                ).utf8))
+                print(text)
+            } catch {
+                failure = error
+            }
+            sem.signal()
+        }
+        sem.wait()
+        if let failure {
+            FileHandle.standardError.write(Data("transcription failed: \(failure)\n".utf8))
+            throw ExitCode(1)
+        }
     }
 }
 
