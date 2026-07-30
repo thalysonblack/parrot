@@ -36,9 +36,56 @@ parrot doctor                          # check permissions + fn key setting
 parrot models list                     # list available models
 parrot models download <id>            # pre-download a model
 parrot --model whisper-large-v3-turbo  # bigger, multilingual, slower first-run
+parrot --language pt                   # dictate in Portuguese (needs a multilingual model)
+parrot transcribe audio.wav            # transcribe a file instead of the mic (debug)
 parrot --hotkey right-option           # change the push-to-talk key
 parrot --no-overlay                    # disable the bottom-of-screen pill
 ```
+
+## Dictating in another language
+
+Two things have to line up: a multilingual model, and the language itself.
+
+```sh
+parrot models download whisper-large-v3-turbo     # 1.6 GB, one time
+parrot --model whisper-large-v3-turbo --language pt
+```
+
+**The model is the part that matters.** The default `whisper-base.en` is
+English-only, and feeding it another language doesn't produce broken text — it
+produces confident, fluent, *invented* English. Measured on 7 seconds of
+Portuguese:
+
+| spoken | `whisper-base.en` returns |
+|---|---|
+| "Fecha o escopo do presskit da imersão de cana na Itália e me manda o orçamento revisado até quarta-feira." | "The first thing is to make the world a better place." |
+
+Nothing in that output is a mistranscription — it's a hallucination, and parrot
+types it straight into whatever field has your cursor. Hence `Resolve.language`
+refusing a non-English language on an `.en` model outright.
+
+**Why `--language` exists anyway, honestly:** less than you'd think. WhisperKit's
+defaults *look* English-forcing on paper (`language` nil + `usePrefillPrompt`
+true → `detectLanguage` false → decoder primed with `<|en|>`), but on
+large-v3-turbo that priming barely bites: forcing `en`, `pt`, `es` and even `ja`
+on the same Portuguese clip returned byte-identical correct Portuguese, with the
+decoder confirming it ran as `ja`. The turbo checkpoint effectively ignores the
+language token when the audio is unambiguous. So treat `--language` as an
+explicit control for ambiguous or noisy input, not as the thing that makes
+Portuguese work. Use `--language auto` to ask for detection when the config file
+names a language.
+
+Because the LaunchAgent runs `parrot run --skip-doctor` with no other arguments,
+put the persistent choice in `~/.config/parrot/config.json` instead of the flags:
+
+```json
+{
+  "model": "whisper-large-v3-turbo",
+  "language": "pt"
+}
+```
+
+Resolution order is flag > config > default, for both keys.
 
 ## Stack
 
