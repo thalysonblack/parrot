@@ -71,3 +71,22 @@ confundem fácil.
 ## Build
 
 `swift build -c release` (~2 min limpo). Binário: `/usr/local/bin/parrot`.
+
+## Trocar o binário exige reconceder acessibilidade
+
+O TCC amarra a permissão ao hash do executável (binário sem Developer ID). Todo
+`swift build` + `cp` para `~/.local/bin` invalida o que já estava concedido — a
+linha continua marcada na lista de Acessibilidade, mentindo, e o parrot volta a
+dar `tapCreateFailed`.
+
+**Ordem obrigatória ao atualizar o binário:**
+
+```sh
+launchctl bootout gui/$UID/com.digimata.parrot     # 1. DESLIGA o agente primeiro
+cp .build/release/parrot ~/.local/bin/parrot        # 2. troca o binário
+# 3. reconceder acessibilidade (remover a linha com "−" e deixar pedir de novo)
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.digimata.parrot.plist
+```
+
+Pular o passo 1 põe o `KeepAlive` em loop: falha o tap → relança → **recarrega
+1,6 GB de modelo** → falha. Aconteceu 3 vezes seguidas em 30/07/2026.
